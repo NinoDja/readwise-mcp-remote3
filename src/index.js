@@ -155,6 +155,19 @@ server.tool("create_highlight", "Create highlights in Readwise", {
 });
 
 const app = express();
+
+// CORS middleware para permitir conexiones desde claude.ai
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+  res.header("Access-Control-Allow-Credentials", "true");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -195,11 +208,22 @@ app.post("/token", (req, res) => {
 const transports = {};
 
 app.get("/sse", async (req, res) => {
-  console.log("New SSE connection");
-  const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-  res.on("close", () => { delete transports[transport.sessionId]; });
-  await server.connect(transport);
+  console.log("New SSE connection from:", req.headers.origin || "unknown");
+  console.log("Headers:", JSON.stringify(req.headers, null, 2));
+  try {
+    const transport = new SSEServerTransport("/messages", res);
+    transports[transport.sessionId] = transport;
+    console.log("SSE transport created, sessionId:", transport.sessionId);
+    res.on("close", () => {
+      console.log("SSE connection closed, sessionId:", transport.sessionId);
+      delete transports[transport.sessionId];
+    });
+    await server.connect(transport);
+    console.log("MCP server connected to transport");
+  } catch (error) {
+    console.error("SSE error:", error);
+    throw error;
+  }
 });
 
 app.post("/messages", async (req, res) => {
