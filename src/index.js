@@ -138,7 +138,7 @@ async function apiV3(endpoint, options = {}) {
 function createMcpServer() {
   const server = new McpServer({
     name: "readwise-mcp-enhanced",
-    version: "2.3.0"
+    version: "2.4.0"
   });
 
   // ===========================================================================
@@ -614,6 +614,216 @@ ${htmlContent}
     return { content: [{ type: "text", text: output }] };
   });
 
+  // 17d. create_continuation - Create a linked follow-up document for iterative workflow
+  server.tool("create_continuation", "Create a new document as part of a series. Perfect for Claude ↔ Readwise iterative workflow: Claude's analysis becomes a new document you can highlight and annotate.", {
+    original_document_id: z.string().describe("ID of the original/previous document in the series"),
+    content: z.string().describe("Content for the new document (Markdown supported)"),
+    part_number: z.number().optional().describe("Part number in series (auto-detected if not provided)"),
+    custom_title: z.string().optional().describe("Custom title (default: auto-generated from original)"),
+  }, async ({ original_document_id, content, part_number, custom_title }) => {
+    // 1. Fetch original document to get title and tags
+    const docResponse = await apiV3("/list/", { params: { id: original_document_id } });
+    const results = docResponse.results || [docResponse];
+    const originalDoc = results[0];
+
+    if (!originalDoc) {
+      return { content: [{ type: "text", text: `❌ Original document ${original_document_id} not found` }] };
+    }
+
+    // 2. Determine series info
+    const originalTitle = originalDoc.title || "Untitled";
+    // Extract base title (remove existing "Part X" or "Análisis #X" suffix)
+    const baseTitle = originalTitle.replace(/\s*[-–—]\s*(Part|Parte|Análisis|Analysis)\s*#?\d+.*$/i, '').trim();
+
+    // Auto-detect part number by searching for existing parts
+    let detectedPart = part_number;
+    if (!detectedPart) {
+      try {
+        const seriesSearch = await apiV3("/list/", { params: { category: "article" } });
+        const seriesDocs = (seriesSearch.results || []).filter(d =>
+          d.title && d.title.includes(baseTitle) && d.title.match(/(Part|Parte|Análisis|Analysis)\s*#?\d+/i)
+        );
+        detectedPart = seriesDocs.length + 2; // +2 because original is Part 1
+      } catch (e) {
+        detectedPart = 2;
+      }
+    }
+
+    // 3. Generate new title
+    const newTitle = custom_title || `${baseTitle} - Análisis #${detectedPart}`;
+
+    // 4. Convert markdown content to HTML
+    function md2html(text) {
+      let h = text;
+      h = h.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      h = h.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre style="background:#f6f8fa;padding:16px;border-radius:8px;overflow-x:auto"><code>$2</code></pre>');
+      h = h.replace(/`([^`]+)`/g, '<code style="background:#f0f0f0;padding:2px 6px;border-radius:4px">$1</code>');
+      h = h.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
+      h = h.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+      h = h.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+      h = h.replace(/^# (.+)$/gm, '<h2>$1</h2>');
+      h = h.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+      h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      h = h.replace(/\*(.+?)\*/g, '<em>$1</em>');
+      h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+      h = h.replace(/^&gt; (.+)$/gm, '<blockquote style="border-left:4px solid #ddd;padding-left:1em;color:#666">$1</blockquote>');
+      h = h.replace(/^[\-\*] (.+)$/gm, '<li>$1</li>');
+      h = h.replace(/((?:<li>.*<\/li>\s*)+)/g, '<ul style="margin:1em 0;padding-left:2em">$1</ul>');
+      h = h.replace(/^---$/gm, '<hr>');
+      const blocks = h.split(/\n\n+/);
+      h = blocks.map(block => {
+        block = block.trim();
+        if (!block) return '';
+        if (/^<(h[1-6]|ul|ol|pre|blockquote|hr)/i.test(block)) return block;
+        return `<p style="margin:1em 0;line-height:1.7">${block.replace(/\n/g, '<br>')}</p>`;
+      }).join('\n');
+      return h;
+    }
+
+    const htmlContent = md2html(content);
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('es-ES', { year: 'numeric', month: 'long', day: 'numeric' });
+
+    // 5. Create HTML with link back to original
+    const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>${newTitle}</title></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#1f2328">
+<article>
+<h1 style="font-size:1.8em;margin:0 0 0.5em;color:#1f2328">${newTitle}</h1>
+<p style="color:#656d76;font-size:0.9em;margin-bottom:1em;padding-bottom:1em;border-bottom:1px solid #eee">
+📚 Serie: <strong>${baseTitle}</strong> · Parte ${detectedPart} · ${dateStr}<br>
+🔗 Documento anterior: ${originalTitle}
+</p>
+${htmlContent}
+<hr style="margin:2em 0;border:none;border-top:1px solid #eee">
+<p style="color:#656d76;font-size:0.85em;text-align:center">
+Este documento es parte de una serie de exploración iterativa.<br>
+Haz highlights y notas, luego pide a Claude que continúe el análisis.
+</p>
+</article>
+</body>
+</html>`;
+
+    // 6. Get original tags and add series tag
+    const originalTags = originalDoc.tags || [];
+    const tagNames = originalTags.map(t => typeof t === 'string' ? t : t.name).filter(Boolean);
+    const seriesTag = `serie:${baseTitle.toLowerCase().replace(/\s+/g, '-').substring(0, 30)}`;
+    if (!tagNames.includes(seriesTag)) tagNames.push(seriesTag);
+    tagNames.push('claude-analysis');
+
+    // 7. Save new document
+    const timestamp = Date.now();
+    const newDoc = await apiV3("/save/", {
+      method: "POST",
+      body: {
+        url: `https://claude.ai/series/${timestamp}`,
+        html,
+        title: newTitle,
+        author: "Claude AI",
+        tags: tagNames,
+        location: "new",
+        saved_using: "Claude Mobile",
+        category: "article"
+      }
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: `✅ **Continuación creada exitosamente!**
+
+**Nuevo documento:** ${newTitle}
+**Parte:** ${detectedPart} de la serie
+**Serie:** ${baseTitle}
+**Tags:** ${tagNames.join(', ')}
+
+El usuario ahora puede:
+1. Abrir este documento en Readwise Reader
+2. Hacer highlights y anotaciones sobre tu análisis
+3. Pedirte que continúes con la siguiente parte
+
+**ID del nuevo documento:** ${newDoc.id || 'ver en Reader'}`
+      }]
+    };
+  });
+
+  // 17e. get_document_series - Get all documents in a series for comprehensive analysis
+  server.tool("get_document_series", "Get all documents in a series with their highlights. Perfect for Claude to analyze the complete iterative exploration.", {
+    series_identifier: z.string().describe("Title fragment, tag, or document ID to identify the series"),
+    include_highlights: z.boolean().optional().describe("Include highlights from all documents (default: true)"),
+  }, async ({ series_identifier, include_highlights = true }) => {
+    // Search for documents matching the series
+    const searchResponse = await apiV3("/list/", { params: { category: "article" } });
+    const allDocs = searchResponse.results || [];
+
+    // Filter by title containing the identifier or by tag
+    const seriesDocs = allDocs.filter(d => {
+      const titleMatch = d.title && d.title.toLowerCase().includes(series_identifier.toLowerCase());
+      const tagMatch = d.tags && d.tags.some(t => {
+        const tagName = typeof t === 'string' ? t : t.name;
+        return tagName && tagName.toLowerCase().includes(series_identifier.toLowerCase());
+      });
+      const idMatch = d.id === series_identifier;
+      return titleMatch || tagMatch || idMatch;
+    });
+
+    if (seriesDocs.length === 0) {
+      return { content: [{ type: "text", text: `❌ No documents found matching "${series_identifier}"` }] };
+    }
+
+    // Sort by created date or title (to get proper order)
+    seriesDocs.sort((a, b) => {
+      const dateA = new Date(a.created_at || a.saved_at || 0);
+      const dateB = new Date(b.created_at || b.saved_at || 0);
+      return dateA - dateB;
+    });
+
+    let output = `# Serie: ${series_identifier}\n`;
+    output += `**Total documentos:** ${seriesDocs.length}\n\n`;
+    output += `---\n\n`;
+
+    for (let i = 0; i < seriesDocs.length; i++) {
+      const doc = seriesDocs[i];
+      output += `## Documento ${i + 1}: ${doc.title}\n`;
+      output += `**ID:** ${doc.id}\n`;
+      output += `**Autor:** ${doc.author || 'Unknown'}\n`;
+      output += `**Progreso:** ${doc.reading_progress ? Math.round(doc.reading_progress * 100) + '%' : 'N/A'}\n\n`;
+
+      if (doc.summary) {
+        output += `### Resumen\n${doc.summary}\n\n`;
+      }
+
+      if (doc.notes || doc.document_note) {
+        output += `### Notas del documento\n${doc.notes || doc.document_note}\n\n`;
+      }
+
+      if (include_highlights) {
+        try {
+          const highlightsData = await apiV2("/highlights/", { params: { book_id: doc.id, page_size: 50 } });
+          const highlights = highlightsData.results || [];
+
+          if (highlights.length > 0) {
+            output += `### Highlights (${highlights.length})\n\n`;
+            highlights.forEach((h, j) => {
+              output += `> ${h.text}\n`;
+              if (h.note) output += `**Nota:** ${h.note}\n`;
+              output += `\n`;
+            });
+          }
+        } catch (e) {
+          output += `*No se pudieron cargar highlights*\n\n`;
+        }
+      }
+
+      output += `---\n\n`;
+    }
+
+    output += `\n**Para continuar la serie:** usa create_continuation con el ID del último documento.`;
+
+    return { content: [{ type: "text", text: output }] };
+  });
+
   // 18. delete_document
   server.tool("delete_document", "Delete a document from your Readwise Reader library", {
     document_id: z.string().describe("ID of the document to delete"),
@@ -1024,8 +1234,8 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     server: "readwise-mcp-enhanced",
-    version: "2.3.0",
-    tools: 37,
+    version: "2.4.0",
+    tools: 39,
     auth: "oauth2",
     transport: "streamable-http"
   });
@@ -1105,8 +1315,8 @@ app.get("/mcp", (req, res) => res.status(405).json({ error: "Use POST" }));
 app.get("/", (req, res) => {
   res.json({
     name: "Readwise MCP Enhanced",
-    version: "2.3.0",
-    tools: 37,
+    version: "2.4.0",
+    tools: 39,
     status: "running",
     auth: "oauth2"
   });
