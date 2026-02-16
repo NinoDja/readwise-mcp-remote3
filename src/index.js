@@ -1,6 +1,7 @@
 ﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
+import crypto from "crypto";
 import { z } from "zod";
 
 const READWISE_API_KEY = process.env.READWISE_API_KEY;
@@ -13,6 +14,9 @@ if (!READWISE_API_KEY) {
 
 const READWISE_BASE = "https://readwise.io/api/v2";
 const READER_BASE = "https://readwise.io/api/v3";
+
+const authCodes = new Map();
+const accessTokens = new Set();
 
 async function readwiseV2(endpoint, params = {}) {
   const url = new URL(`${READWISE_BASE}${endpoint}`);
@@ -151,30 +155,78 @@ server.tool("create_highlight", "Create highlights in Readwise", {
 });
 
 const app = express();
-const transports = {};
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok", server: "readwise-mcp-remote", version: "1.0.0" });
 });
 
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, response_type, state } = req.query;
+  console.log(`OAuth authorize: redirect_uri=${redirect_uri}`);
+  const code = crypto.randomUUID();
+  authCodes.set(code, { redirectUri: redirect_uri, createdAt: Date.now() });
+  for (const [k, v] of authCodes) {
+    if (Date.now() - v.createdAt > 600000) authCodes.delete(k);
+  }
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set("code", code);
+  if (state) redirectUrl.searchParams.set("state", state);
+  res.redirect(redirectUrl.toString());
+});
+
+app.post("/token", (req, res) => {
+  const { grant_type, code } = req.body;
+  console.log(`OAuth token: grant_type=${grant_type}`);
+  const token = crypto.randomUUID();
+  accessTokens.add(token);
+  if (grant_type === "authorization_code" && code && authCodes.has(code)) {
+    authCodes.delete(code);
+  }
+  res.json({
+    access_token: token,
+    token_type: "Bearer",
+    expires_in: 86400,
+    refresh_token: crypto.randomUUID(),
+  });
+});
+
+const transports = {};
+
 app.get("/sse", async (req, res) => {
   console.log("New SSE connection");
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
-  res.on("close", () => {
-    console.log(`SSE closed: ${transport.sessionId}`);
-    delete transports[transport.sessionId];
-  });
+  res.on("close", () => { delete transports[transport.sessionId]; });
   await server.connect(transport);
 });
 
-app.post("/messages", express.json(), async (req, res) => {
+app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
   if (!transport) return res.status(404).json({ error: "Session not found" });
   await transport.handlePostMessage(req, res);
 });
 
+app.get("/", (req, res) => {
+  res.json({ name: "Readwise MCP Remote", version: "1.0.0", status: "running" });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Readwise MCP Server running on port ${PORT}`);
 });
+```
+
+---
+
+**2. Para encontrar y editar el archivo en tu PC:**
+
+Abre el Explorador de Windows y navega a:
+```
+C:\Users\kkaaz\readwise-mcp-remote\src\index.js
+```
+
+Si no lo encuentras, abre PowerShell y ejecuta:
+```
+notepad C:\Users\kkaaz\readwise-mcp-remote\src\index.js
