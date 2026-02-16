@@ -138,7 +138,7 @@ async function apiV3(endpoint, options = {}) {
 function createMcpServer() {
   const server = new McpServer({
     name: "readwise-mcp-enhanced",
-    version: "2.0.0"
+    version: "2.1.0"
   });
 
   // ===========================================================================
@@ -371,10 +371,11 @@ function createMcpServer() {
   });
 
   // 16. save_document
-  server.tool("save_document", "Save a new document (URL, article, or webpage) to Readwise Reader", {
-    url: z.string().describe("URL of the document to save"),
-    title: z.string().optional(),
-    author: z.string().optional(),
+  server.tool("save_document", "Save a new document to Readwise Reader. Can save by URL or by providing HTML content directly (bypasses bot protection)", {
+    url: z.string().describe("URL of the document. For generated content, use a placeholder like 'https://claude.ai/generated/TIMESTAMP'"),
+    html: z.string().optional().describe("HTML content to save directly. When provided, Readwise uses this instead of fetching the URL. Wrap text in basic HTML tags."),
+    title: z.string().optional().describe("Title of the document (required when using html parameter)"),
+    author: z.string().optional().describe("Author name (e.g., 'Claude AI')"),
     summary: z.string().optional(),
     published_date: z.string().optional().describe("Publication date (ISO 8601)"),
     image_url: z.string().optional(),
@@ -384,6 +385,51 @@ function createMcpServer() {
     notes: z.string().optional().describe("Top-level note for the document"),
   }, async (params) => {
     const data = await apiV3("/save/", { method: "POST", body: params });
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+  // 16b. save_text_content - Convenience tool for saving generated text
+  server.tool("save_text_content", "Save text content directly to Readwise Reader (perfect for Claude-generated content, bypasses bot protection)", {
+    content: z.string().describe("The text content to save (plain text or markdown)"),
+    title: z.string().describe("Title of the document"),
+    author: z.string().optional().default("Claude AI").describe("Author name"),
+    summary: z.string().optional().describe("Brief summary of the content"),
+    tags: z.array(z.string()).optional().describe("Tags to apply"),
+    location: z.enum(["new", "later", "archive"]).optional().default("new"),
+    source: z.string().optional().default("Claude Mobile").describe("Source application name"),
+  }, async ({ content, title, author, summary, tags, location, source }) => {
+    // Convert markdown-like content to basic HTML
+    const htmlContent = content
+      .split('\n\n').map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('\n');
+
+    const html = `<!DOCTYPE html>
+<html>
+<head><title>${title}</title></head>
+<body>
+<article>
+<h1>${title}</h1>
+${author ? `<p><em>By ${author}</em></p>` : ''}
+${htmlContent}
+</article>
+</body>
+</html>`;
+
+    const timestamp = Date.now();
+    const data = await apiV3("/save/", {
+      method: "POST",
+      body: {
+        url: `https://claude.ai/conversation/${timestamp}`,
+        html,
+        title,
+        author: author || "Claude AI",
+        summary,
+        tags,
+        location: location || "new",
+        saved_using: source || "Claude Mobile",
+        category: "article"
+      }
+    });
+
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   });
 
@@ -815,8 +861,8 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     server: "readwise-mcp-enhanced",
-    version: "2.0.0",
-    tools: 34,
+    version: "2.1.0",
+    tools: 35,
     auth: "oauth2",
     transport: "streamable-http"
   });
@@ -896,8 +942,8 @@ app.get("/mcp", (req, res) => res.status(405).json({ error: "Use POST" }));
 app.get("/", (req, res) => {
   res.json({
     name: "Readwise MCP Enhanced",
-    version: "2.0.0",
-    tools: 34,
+    version: "2.1.0",
+    tools: 35,
     status: "running",
     auth: "oauth2"
   });
