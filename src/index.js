@@ -138,7 +138,7 @@ async function apiV3(endpoint, options = {}) {
 function createMcpServer() {
   const server = new McpServer({
     name: "readwise-mcp-enhanced",
-    version: "2.1.0"
+    version: "2.2.0"
   });
 
   // ===========================================================================
@@ -388,27 +388,88 @@ function createMcpServer() {
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   });
 
-  // 16b. save_text_content - Convenience tool for saving generated text
-  server.tool("save_text_content", "Save text content directly to Readwise Reader (perfect for Claude-generated content, bypasses bot protection)", {
-    content: z.string().describe("The text content to save (plain text or markdown)"),
+  // 16b. save_text_content - Save formatted content to Reader
+  server.tool("save_text_content", "Save text/markdown content to Readwise Reader with beautiful formatting. Supports: # headings, **bold**, *italic*, - lists, > quotes, ```code blocks```", {
+    content: z.string().describe("Content in Markdown format"),
     title: z.string().describe("Title of the document"),
-    author: z.string().optional().default("Claude AI").describe("Author name"),
-    summary: z.string().optional().describe("Brief summary of the content"),
+    author: z.string().optional().describe("Author name (default: Claude AI)"),
+    summary: z.string().optional().describe("Brief summary"),
     tags: z.array(z.string()).optional().describe("Tags to apply"),
-    location: z.enum(["new", "later", "archive"]).optional().default("new"),
-    source: z.string().optional().default("Claude Mobile").describe("Source application name"),
-  }, async ({ content, title, author, summary, tags, location, source }) => {
-    // Convert markdown-like content to basic HTML
-    const htmlContent = content
-      .split('\n\n').map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('\n');
+    location: z.enum(["new", "later", "archive"]).optional(),
+  }, async ({ content, title, author = "Claude AI", summary, tags, location = "new" }) => {
+
+    // Markdown to HTML converter
+    function md2html(text) {
+      let h = text;
+
+      // Escape HTML entities first
+      h = h.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+      // Code blocks ```
+      h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) =>
+        `<pre style="background:#f6f8fa;padding:16px;border-radius:8px;overflow-x:auto;font-size:14px;line-height:1.5"><code>${code.trim()}</code></pre>`);
+
+      // Inline code `
+      h = h.replace(/`([^`]+)`/g, '<code style="background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:0.9em">$1</code>');
+
+      // Headings
+      h = h.replace(/^#### (.+)$/gm, '<h4 style="font-size:1.1em;margin:1.5em 0 0.5em;color:#24292f">$1</h4>');
+      h = h.replace(/^### (.+)$/gm, '<h3 style="font-size:1.25em;margin:1.5em 0 0.5em;color:#24292f">$1</h3>');
+      h = h.replace(/^## (.+)$/gm, '<h2 style="font-size:1.5em;margin:1.5em 0 0.5em;color:#24292f;border-bottom:1px solid #eee;padding-bottom:0.3em">$1</h2>');
+      h = h.replace(/^# (.+)$/gm, '<h2 style="font-size:1.5em;margin:1.5em 0 0.5em;color:#24292f;border-bottom:1px solid #eee;padding-bottom:0.3em">$1</h2>');
+
+      // Bold & Italic
+      h = h.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+      h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      h = h.replace(/\*(.+?)\*/g, '<em>$1</em>');
+      h = h.replace(/_(.+?)_/g, '<em>$1</em>');
+
+      // Links [text](url)
+      h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" style="color:#0969da;text-decoration:none">$1</a>');
+
+      // Blockquotes
+      h = h.replace(/^&gt; (.+)$/gm, '<blockquote style="border-left:4px solid #ddd;margin:1em 0;padding:0.5em 1em;color:#656d76;background:#f6f8fa">$1</blockquote>');
+
+      // Unordered lists
+      h = h.replace(/^[\-\*] (.+)$/gm, '<li style="margin:0.25em 0">$1</li>');
+
+      // Ordered lists
+      h = h.replace(/^\d+\. (.+)$/gm, '<li style="margin:0.25em 0">$1</li>');
+
+      // Wrap consecutive <li> in <ul>
+      h = h.replace(/((?:<li[^>]*>.*<\/li>\s*)+)/g, '<ul style="margin:1em 0;padding-left:2em">$1</ul>');
+
+      // Horizontal rules
+      h = h.replace(/^---$/gm, '<hr style="border:none;border-top:1px solid #eee;margin:2em 0">');
+
+      // Paragraphs
+      const blocks = h.split(/\n\n+/);
+      h = blocks.map(block => {
+        block = block.trim();
+        if (!block) return '';
+        if (/^<(h[1-6]|ul|ol|pre|blockquote|hr)/i.test(block)) return block;
+        return `<p style="margin:1em 0;line-height:1.7">${block.replace(/\n/g, '<br>')}</p>`;
+      }).join('\n');
+
+      return h;
+    }
+
+    const htmlContent = md2html(content);
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('es-ES', { year: 'numeric', month: 'long', day: 'numeric' });
 
     const html = `<!DOCTYPE html>
 <html>
-<head><title>${title}</title></head>
-<body>
+<head>
+<meta charset="UTF-8">
+<title>${title}</title>
+</head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#1f2328;background:#fff">
 <article>
-<h1>${title}</h1>
-${author ? `<p><em>By ${author}</em></p>` : ''}
+<h1 style="font-size:2em;margin:0 0 0.5em;color:#1f2328;font-weight:600">${title}</h1>
+<p style="color:#656d76;font-size:0.9em;margin-bottom:2em;padding-bottom:1em;border-bottom:1px solid #eee">
+${author} · ${dateStr}
+</p>
 ${htmlContent}
 </article>
 </body>
@@ -418,19 +479,19 @@ ${htmlContent}
     const data = await apiV3("/save/", {
       method: "POST",
       body: {
-        url: `https://claude.ai/conversation/${timestamp}`,
+        url: `https://claude.ai/generated/${timestamp}`,
         html,
         title,
-        author: author || "Claude AI",
+        author,
         summary,
         tags,
-        location: location || "new",
-        saved_using: source || "Claude Mobile",
+        location,
+        saved_using: "Claude Mobile",
         category: "article"
       }
     });
 
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    return { content: [{ type: "text", text: `✅ Saved "${title}" to Readwise Reader\n\n${JSON.stringify(data, null, 2)}` }] };
   });
 
   // 17. update_document
@@ -861,7 +922,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     server: "readwise-mcp-enhanced",
-    version: "2.1.0",
+    version: "2.2.0",
     tools: 35,
     auth: "oauth2",
     transport: "streamable-http"
@@ -942,7 +1003,7 @@ app.get("/mcp", (req, res) => res.status(405).json({ error: "Use POST" }));
 app.get("/", (req, res) => {
   res.json({
     name: "Readwise MCP Enhanced",
-    version: "2.1.0",
+    version: "2.2.0",
     tools: 35,
     status: "running",
     auth: "oauth2"
