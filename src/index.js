@@ -4,13 +4,89 @@ import express from "express";
 import crypto from "crypto";
 import { z } from "zod";
 
+// =============================================================================
+// CONFIGURACIÓN Y CREDENCIALES
+// =============================================================================
+
 const READWISE_API_KEY = process.env.READWISE_API_KEY;
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
 const PORT = process.env.PORT || 3000;
 
+// Validar variables requeridas
 if (!READWISE_API_KEY) {
-  console.error("READWISE_API_KEY environment variable is required");
+  console.error("❌ READWISE_API_KEY environment variable is required");
   process.exit(1);
 }
+
+if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
+  console.error("❌ OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required for security");
+  console.error("   Set these in Render environment variables");
+  process.exit(1);
+}
+
+console.log("✅ Security credentials configured");
+
+// =============================================================================
+// ALMACENAMIENTO DE TOKENS (en memoria - se reinicia con el servidor)
+// =============================================================================
+
+// Códigos de autorización temporales (válidos 10 minutos)
+const authCodes = new Map(); // code -> { clientId, redirectUri, createdAt }
+
+// Access tokens válidos (válidos 24 horas)
+const validTokens = new Map(); // token -> { clientId, createdAt }
+
+// Limpiar tokens expirados cada 5 minutos
+setInterval(() => {
+  const now = Date.now();
+
+  // Limpiar auth codes (10 min)
+  for (const [code, data] of authCodes) {
+    if (now - data.createdAt > 10 * 60 * 1000) {
+      authCodes.delete(code);
+    }
+  }
+
+  // Limpiar access tokens (24 horas)
+  for (const [token, data] of validTokens) {
+    if (now - data.createdAt > 24 * 60 * 60 * 1000) {
+      validTokens.delete(token);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// =============================================================================
+// FUNCIONES DE AUTENTICACIÓN
+// =============================================================================
+
+function validateClientCredentials(clientId, clientSecret) {
+  return clientId === OAUTH_CLIENT_ID && clientSecret === OAUTH_CLIENT_SECRET;
+}
+
+function validateAccessToken(authHeader) {
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return false;
+  }
+  const token = authHeader.slice(7);
+  const tokenData = validTokens.get(token);
+
+  if (!tokenData) {
+    return false;
+  }
+
+  // Verificar que no haya expirado (24 horas)
+  if (Date.now() - tokenData.createdAt > 24 * 60 * 60 * 1000) {
+    validTokens.delete(token);
+    return false;
+  }
+
+  return true;
+}
+
+// =============================================================================
+// READWISE API HELPERS
+// =============================================================================
 
 const READWISE_BASE = "https://readwise.io/api/v2";
 const READER_BASE = "https://readwise.io/api/v3";
@@ -46,6 +122,10 @@ async function readerV3(endpoint, params = {}, method = "GET", body = null) {
   if (!res.ok) throw new Error(`Reader API error: ${res.status} ${await res.text()}`);
   return res.json();
 }
+
+// =============================================================================
+// MCP SERVER FACTORY
+// =============================================================================
 
 function createMcpServer() {
   const server = new McpServer({ name: "readwise-remote", version: "1.0.0" });
@@ -155,6 +235,10 @@ function createMcpServer() {
   return server;
 }
 
+// =============================================================================
+// EXPRESS APP
+// =============================================================================
+
 const app = express();
 
 // CORS middleware
@@ -170,36 +254,128 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Health check
+// =============================================================================
+// HEALTH CHECK (público)
+// =============================================================================
+
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", server: "readwise-mcp-remote", version: "1.0.0", transport: "streamable-http" });
-});
-
-// OAuth endpoints for claude.ai compatibility
-app.get("/authorize", (req, res) => {
-  const { redirect_uri, state } = req.query;
-  console.log(`OAuth authorize: redirect_uri=${redirect_uri}`);
-  const code = crypto.randomUUID();
-  const redirectUrl = new URL(redirect_uri);
-  redirectUrl.searchParams.set("code", code);
-  if (state) redirectUrl.searchParams.set("state", state);
-  res.redirect(redirectUrl.toString());
-});
-
-app.post("/token", (req, res) => {
-  console.log(`OAuth token request`);
   res.json({
-    access_token: crypto.randomUUID(),
-    token_type: "Bearer",
-    expires_in: 86400,
-    refresh_token: crypto.randomUUID(),
+    status: "ok",
+    server: "readwise-mcp-remote",
+    version: "1.0.0",
+    transport: "streamable-http",
+    auth: "oauth2"
   });
 });
 
-// Streamable HTTP MCP endpoint
+// =============================================================================
+// OAUTH 2.0 ENDPOINTS
+// =============================================================================
+
+// Step 1: Authorization - claude.ai redirige aquí
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, response_type, state } = req.query;
+
+  console.log(`🔐 OAuth authorize request: client_id=${client_id}`);
+
+  // Validar client_id
+  if (client_id !== OAUTH_CLIENT_ID) {
+    console.log(`❌ Invalid client_id: ${client_id}`);
+    return res.status(401).json({ error: "invalid_client", message: "Invalid client_id" });
+  }
+
+  // Generar código de autorización
+  const code = crypto.randomUUID();
+  authCodes.set(code, {
+    clientId: client_id,
+    redirectUri: redirect_uri,
+    createdAt: Date.now()
+  });
+
+  console.log(`✅ Auth code generated for client: ${client_id}`);
+
+  // Redirigir de vuelta a claude.ai con el código
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set("code", code);
+  if (state) redirectUrl.searchParams.set("state", state);
+
+  res.redirect(redirectUrl.toString());
+});
+
+// Step 2: Token exchange - claude.ai intercambia código por token
+app.post("/token", (req, res) => {
+  const { grant_type, code, client_id, client_secret, refresh_token } = req.body;
+
+  console.log(`🔐 OAuth token request: grant_type=${grant_type}`);
+
+  // Validar credenciales del cliente
+  if (!validateClientCredentials(client_id, client_secret)) {
+    console.log(`❌ Invalid client credentials`);
+    return res.status(401).json({ error: "invalid_client", message: "Invalid client credentials" });
+  }
+
+  if (grant_type === "authorization_code") {
+    // Validar código de autorización
+    const authData = authCodes.get(code);
+    if (!authData) {
+      console.log(`❌ Invalid or expired auth code`);
+      return res.status(400).json({ error: "invalid_grant", message: "Invalid or expired authorization code" });
+    }
+
+    // Verificar que el client_id coincide
+    if (authData.clientId !== client_id) {
+      console.log(`❌ Client ID mismatch`);
+      return res.status(400).json({ error: "invalid_grant", message: "Client ID mismatch" });
+    }
+
+    // Eliminar código usado (solo se puede usar una vez)
+    authCodes.delete(code);
+
+  } else if (grant_type === "refresh_token") {
+    // Para refresh, solo validamos las credenciales (ya validadas arriba)
+    console.log(`🔄 Refreshing token`);
+  } else {
+    return res.status(400).json({ error: "unsupported_grant_type" });
+  }
+
+  // Generar nuevo access token
+  const accessToken = crypto.randomUUID();
+  const refreshTokenNew = crypto.randomUUID();
+
+  // Almacenar token válido
+  validTokens.set(accessToken, {
+    clientId: client_id,
+    createdAt: Date.now()
+  });
+
+  console.log(`✅ Access token issued for client: ${client_id}`);
+
+  res.json({
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: 86400, // 24 horas
+    refresh_token: refreshTokenNew
+  });
+});
+
+// =============================================================================
+// MCP ENDPOINT (protegido con Bearer token)
+// =============================================================================
+
 app.post("/mcp", async (req, res) => {
-  console.log("MCP POST request received");
+  // Validar token de acceso
+  if (!validateAccessToken(req.headers.authorization)) {
+    console.log(`❌ MCP request rejected: invalid or missing token`);
+    return res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized: invalid or missing access token" },
+      id: null
+    });
+  }
+
+  console.log("✅ MCP request authenticated");
   console.log("Body:", JSON.stringify(req.body, null, 2));
 
   try {
@@ -209,7 +385,6 @@ app.post("/mcp", async (req, res) => {
     });
 
     res.on("close", () => {
-      console.log("MCP connection closed");
       transport.close();
       server.close();
     });
@@ -228,44 +403,50 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-// GET endpoint for server-initiated messages (optional)
-app.get("/mcp", async (req, res) => {
-  console.log("MCP GET request received");
+// GET y DELETE para /mcp
+app.get("/mcp", (req, res) => {
   res.status(405).json({ error: "Method not allowed - use POST" });
 });
 
-// DELETE endpoint for session termination
-app.delete("/mcp", async (req, res) => {
-  console.log("MCP DELETE request received");
+app.delete("/mcp", (req, res) => {
   res.status(405).json({ error: "Method not allowed - stateless server" });
 });
 
-// Keep SSE endpoint for backwards compatibility
+// =============================================================================
+// OTROS ENDPOINTS
+// =============================================================================
+
+// SSE deprecado
 app.get("/sse", (req, res) => {
-  console.log("SSE endpoint hit - redirecting to use /mcp with POST");
   res.status(410).json({
     error: "SSE transport deprecated",
-    message: "Please use /mcp endpoint with POST method (Streamable HTTP transport)"
+    message: "Please use /mcp endpoint with POST method"
   });
 });
 
-// Root endpoint
+// Root
 app.get("/", (req, res) => {
   res.json({
     name: "Readwise MCP Remote",
     version: "1.0.0",
     status: "running",
     transport: "streamable-http",
+    auth: "oauth2",
     endpoints: {
-      mcp: "/mcp (POST)",
+      mcp: "/mcp (POST, requires Bearer token)",
       health: "/health",
       oauth: "/authorize, /token"
     }
   });
 });
 
+// =============================================================================
+// START SERVER
+// =============================================================================
+
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Readwise MCP Server running on port ${PORT}`);
-  console.log(`Transport: Streamable HTTP`);
-  console.log(`MCP endpoint: /mcp`);
+  console.log(`🚀 Readwise MCP Server running on port ${PORT}`);
+  console.log(`🔒 OAuth2 authentication ENABLED`);
+  console.log(`📡 Transport: Streamable HTTP`);
+  console.log(`🎯 MCP endpoint: /mcp`);
 });
