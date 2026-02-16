@@ -1,4 +1,4 @@
-﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
 import crypto from "crypto";
@@ -216,17 +216,3 @@ app.get("/", (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Readwise MCP Server running on port ${PORT}`);
 });
-```
-
----
-
-**2. Para encontrar y editar el archivo en tu PC:**
-
-Abre el Explorador de Windows y navega a:
-```
-C:\Users\kkaaz\readwise-mcp-remote\src\index.js
-```
-
-Si no lo encuentras, abre PowerShell y ejecuta:
-```
-notepad C:\Users\kkaaz\readwise-mcp-remote\src\index.js
