@@ -138,7 +138,7 @@ async function apiV3(endpoint, options = {}) {
 function createMcpServer() {
   const server = new McpServer({
     name: "readwise-mcp-enhanced",
-    version: "2.2.0"
+    version: "2.3.0"
   });
 
   // ===========================================================================
@@ -510,6 +510,108 @@ ${htmlContent}
   }, async ({ document_id, ...updates }) => {
     const data = await apiV3(`/update/${document_id}/`, { method: "PATCH", body: updates });
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+  // 17b. expand_document - Append content to document notes (for iterative workflow)
+  server.tool("expand_document", "Append new content to an existing document's notes. Perfect for iterative analysis: you highlight in Readwise, Claude analyzes and appends insights to the same document.", {
+    document_id: z.string().describe("ID of the document to expand"),
+    content: z.string().describe("New content to append (supports markdown: # headings, **bold**, *italic*, - lists)"),
+    section_title: z.string().optional().describe("Optional title for this section (e.g., 'Analysis #2 - Feb 16')"),
+    separator: z.boolean().optional().describe("Add a visual separator before new content (default: true)"),
+  }, async ({ document_id, content, section_title, separator = true }) => {
+    // 1. Fetch current document to get existing notes
+    const docResponse = await apiV3("/list/", { params: { id: document_id } });
+    const results = docResponse.results || [docResponse];
+    const doc = results[0];
+
+    if (!doc) {
+      return { content: [{ type: "text", text: `❌ Document ${document_id} not found` }] };
+    }
+
+    const existingNotes = doc.notes || doc.document_note || "";
+    const now = new Date();
+    const timestamp = now.toLocaleString('es-ES', {
+      year: 'numeric', month: 'short', day: 'numeric',
+      hour: '2-digit', minute: '2-digit'
+    });
+
+    // 2. Build new content block
+    let newBlock = "";
+    if (separator) {
+      newBlock += "\n\n───────────────────────────\n\n";
+    }
+    if (section_title) {
+      newBlock += `## ${section_title}\n`;
+    }
+    newBlock += `*${timestamp}*\n\n`;
+    newBlock += content;
+
+    // 3. Combine existing + new
+    const updatedNotes = existingNotes + newBlock;
+
+    // 4. Update document
+    const updateResponse = await apiV3(`/update/${document_id}/`, {
+      method: "PATCH",
+      body: { notes: updatedNotes }
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: `✅ Document expanded successfully!\n\n**Document:** ${doc.title}\n**Section added:** ${section_title || '(unnamed)'}\n**Total notes length:** ${updatedNotes.length} chars\n\nThe document notes now contain your accumulated analysis.`
+      }]
+    };
+  });
+
+  // 17c. get_document_with_highlights - Get document + all highlights for analysis
+  server.tool("get_document_for_analysis", "Get a document with all its highlights and notes - perfect for Claude to analyze your annotations", {
+    document_id: z.string().describe("ID of the document to analyze"),
+  }, async ({ document_id }) => {
+    // Fetch document
+    const docResponse = await apiV3("/list/", { params: { id: document_id } });
+    const results = docResponse.results || [docResponse];
+    const doc = results[0];
+
+    if (!doc) {
+      return { content: [{ type: "text", text: `❌ Document ${document_id} not found` }] };
+    }
+
+    // Fetch highlights for this document
+    const highlightsData = await apiV2("/highlights/", {
+      params: { book_id: document_id, page_size: 100 }
+    });
+
+    // Also try to get from export endpoint for better data
+    let highlights = highlightsData.results || [];
+
+    // Format output for Claude to analyze
+    let output = `# ${doc.title}\n`;
+    output += `**Author:** ${doc.author || 'Unknown'}\n`;
+    output += `**URL:** ${doc.url || doc.source_url || 'N/A'}\n`;
+    output += `**Reading Progress:** ${doc.reading_progress ? Math.round(doc.reading_progress * 100) + '%' : 'Unknown'}\n\n`;
+
+    if (doc.summary) {
+      output += `## Summary\n${doc.summary}\n\n`;
+    }
+
+    if (doc.notes || doc.document_note) {
+      output += `## Document Notes\n${doc.notes || doc.document_note}\n\n`;
+    }
+
+    output += `## Your Highlights & Annotations (${highlights.length})\n\n`;
+
+    highlights.forEach((h, i) => {
+      output += `### Highlight ${i + 1}\n`;
+      output += `> ${h.text}\n\n`;
+      if (h.note) {
+        output += `**Your note:** ${h.note}\n\n`;
+      }
+      if (h.tags && h.tags.length > 0) {
+        output += `**Tags:** ${h.tags.map(t => t.name || t).join(', ')}\n\n`;
+      }
+    });
+
+    return { content: [{ type: "text", text: output }] };
   });
 
   // 18. delete_document
@@ -922,8 +1024,8 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     server: "readwise-mcp-enhanced",
-    version: "2.2.0",
-    tools: 35,
+    version: "2.3.0",
+    tools: 37,
     auth: "oauth2",
     transport: "streamable-http"
   });
@@ -1003,8 +1105,8 @@ app.get("/mcp", (req, res) => res.status(405).json({ error: "Use POST" }));
 app.get("/", (req, res) => {
   res.json({
     name: "Readwise MCP Enhanced",
-    version: "2.2.0",
-    tools: 35,
+    version: "2.3.0",
+    tools: 37,
     status: "running",
     auth: "oauth2"
   });
